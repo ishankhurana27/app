@@ -1,10 +1,12 @@
+import uuid
 from fastapi import APIRouter, UploadFile, File, Form, Depends, Query, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 import json
 import logging
 from app.database import SessionLocal
 from app.models import MaritimeDataCDF, Source, SubSource, UploadMetadata
-from app.etl import convert_to_cdf, convert_to_cdf_from_csv_row, parse_structured_file
+from app.etl import convert_to_ais, convert_to_cdf, convert_to_cdf_from_csv_row, convert_to_piracy, parse_structured_file
 from geoalchemy2.shape import to_shape
 import pandas as pd
 from fastapi.responses import StreamingResponse
@@ -40,19 +42,20 @@ def run_spark_etl(data: list[dict]):
 # ------------------ FILE DETECTION ENTRY ------------------
 @router.post("/upload/detect")
 async def upload_detected_file(
-    type_of_data: str = Form(...),
+    source: str = Form(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
     try:
         content_type = file.content_type
         filename = file.filename.lower()
+        print(f"Detected file type: {content_type}, filename: {filename}")
 
         if content_type in ["application/x-ndjson", "application/json"] or filename.endswith(".ndjson"):
-            return await upload_file(type_of_data=type_of_data, file=file, db=db)
+            return await upload_file(upload_source=source, file=file, db=db)
 
         elif content_type in ["text/csv", "application/vnd.ms-excel"] or filename.endswith(".csv"):
-            return await upload_structured(type_of_data=type_of_data, file=file, db=db)
+            return await upload_structured(upload_source=source, file=file, db=db)
 
         elif content_type.startswith("image/") or filename.endswith((".jpg", ".jpeg", ".png")):
             return {"status": "Image file processed", "filename": file.filename}
@@ -68,13 +71,12 @@ async def upload_detected_file(
 
     except Exception as e:
         logging.exception("Detection upload failed")
-        raise HTTPException(status_code=500, detail="Detection upload failed")
+        raise HTTPException(status_code=500,  detail=str(e))
 
 
 # ------------------ NDJSON UPLOAD ------------------
-@router.post("/upload")
 async def upload_file(
-    type_of_data: str = Form(...),
+    upload_source: str = Form(...),
     file: UploadFile = File(...),
     db: Session = Depends(get_db)
 ):
@@ -82,81 +84,110 @@ async def upload_file(
         content = await file.read()
         lines = content.decode("utf-8").splitlines()
 
-        source = db.query(Source).first()
+        source = db.query(Source).filter(func.lower(Source.name) == upload_source.lower()).first()
         sub_source = db.query(SubSource).first()
 
         inserted = 0
         for line in lines:
+            print(f"Processing line: {line}")
             if not line.strip():
                 continue
             try:
+                upload_uuid = str(uuid.uuid4())
                 json_obj = json.loads(line)
-                cdf_data = convert_to_cdf(json_obj)
+                if upload_source.lower() == "piracy":
+                    cdf_data = convert_to_piracy(json_obj,upload_uuid)
+                elif upload_source.lower() == "ais":
+                    cdf_data = convert_to_ais(json_obj,upload_uuid)
+                elif upload_source.lower() == "dmas":
+                    cdf_data = convert_to_cdf(json_obj,upload_uuid)
+                elif upload_source.lower() == "p8i":
+                    cdf_data=convert_to_cdf_from_csv_row(json_obj,upload_uuid)
+            
+
+                else:
+                    print("source not found")
+
                 db_data = MaritimeDataCDF(
                     **cdf_data,
                     source_id=source.id if source else 1,
                     sub_source_id=sub_source.id if sub_source else 1
                 )
                 db.add(db_data)
+                db.commit()
                 inserted += 1
             except Exception as e:
                 logging.warning(f"Skipping line: {e}")
 
-        metadata_entry = UploadMetadata(
-            file_name=file.filename,
-            source_id=source.id if source else 1,
-            sub_source_id=sub_source.id if sub_source else 1,
-            format="NDJSON",
-            record_count=inserted,
-            type_of_data=type_of_data
-        )
-        db.add(metadata_entry)
-        db.commit()
+        # metadata_entry = UploadMetadata(
+        #     file_name=file.filename,
+        #     source_id=source.id if source else 1,
+        #     sub_source_id=sub_source.id if sub_source else 1,
+        #     format="NDJSON",
+        #     record_count=inserted,
+        #     type_of_data=upload_source
+        # )
+        # db.add(metadata_entry)
+        # db.commit()
 
-        all_records = db.query(MaritimeDataCDF).all()
-        record_list = [{
-            "latitude": r.latitude,
-            "longitude": r.longitude,
-            "speed": r.speed,
-            "bearing": r.bearing,
-            "course": r.course,
-            "sys_trk_no": r.sys_trk_no,
-            "raw_data": r.raw_data
-        } for r in all_records]
+        # all_records = db.query(MaritimeDataCDF).all()
+        # record_list = [{
+        #     "latitude": r.latitude,
+        #     "longitude": r.longitude,
+        #     "speed": r.speed,
+        #     "bearing": r.bearing,
+        #     "course": r.course,
+        #     "sys_trk_no": r.sys_trk_no,
+        #     "raw_data": r.raw_data
+        # } for r in all_records]
 
-        run_spark_etl(record_list)
+        # run_spark_etl(record_list)
 
         return {
             "message": f"{inserted} records saved and ETL executed successfully",
-            "type_of_data": type_of_data
+            "type_of_data": upload_source
         }
 
     except Exception as e:
         logging.exception("Failed to process file")
         raise HTTPException(status_code=500, detail="Failed to process file")
 
-# ------------------ STRUCTURED (CSV/Excel) UPLOAD ------------------
-@router.post("/upload/structured")
-async def upload_structured(type_of_data: str = Query(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
+
+async def upload_structured(upload_source: str = Query(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
     try:
         df = parse_structured_file(file)
         
-        # Clean up column names
         df.columns = df.columns.str.strip().str.replace("\u00a0", " ").str.replace("\t", " ").str.replace(r"\s+", " ", regex=True)
 
-        # Generate UUID for this upload
-        upload_uuid = str(uuid.uuid4())
-        print(f"Generated Upload UUID: {upload_uuid}")
+        print(f"Parsed DataFrame with columns: {upload_source}")
 
-        source = db.query(Source).filter(Source.name == "P8I").first()
+        source = db.query(Source).filter(func.lower(Source.name) == upload_source.lower()).first()
         sub_source = db.query(SubSource).first()
 
         inserted = 0
         failed_rows = []
 
         for i, row in df.iterrows():
+            upload_uuid = str(uuid.uuid4())
+            print(f"Generated Upload UUID: {upload_uuid}")
             try:
-                cdf_data = convert_to_cdf_from_csv_row(row)
+                if upload_source.lower() == "piracy":
+                    cdf_data = convert_to_piracy(row,upload_uuid)
+                elif upload_source.lower() == "ais":
+                    cdf_data = convert_to_ais(row,upload_uuid)
+                elif upload_source.lower() == "dmas":
+                    cdf_data = convert_to_cdf(row,upload_uuid)
+                elif upload_source.lower() == "p8i":
+                    cdf_data=convert_to_cdf_from_csv_row(row,upload_uuid)
+            
+
+                else:
+                    print("source not found")
+    # fallback
+             
+
+                 #switch case to handle schema, identify source and call schema accordingly
+               
                 db_data = MaritimeDataCDF(
                     **cdf_data,
                     source_id=source.id if source else 1,
@@ -169,31 +200,31 @@ async def upload_structured(type_of_data: str = Query(...), file: UploadFile = F
                 failed_rows.append(f"Row {i} failed: {e}")
                 logging.warning(f"Row {i} failed: {e}")
 
-        metadata_entry = UploadMetadata(
-            file_name=file.filename,
-            source_id=source.id if source else 1,
-            sub_source_id=sub_source.id if sub_source else 1,
-            format="CSV",
-            record_count=inserted,
-            type_of_data=type_of_data,
-            upload_uuid=upload_uuid
-        )
-        db.add(metadata_entry)
+        # metadata_entry = UploadMetadata(
+        #     file_name=file.filename,
+        #     source_id=source.id if source else 1,
+        #     sub_source_id=sub_source.id if sub_source else 1,
+        #     format="CSV",
+        #     record_count=inserted,
+        #     type_of_data=upload_source,
+        #     upload_uuid=upload_uuid
+        # )
+        # db.add(metadata_entry)
         db.commit()
 
 
-        all_records = db.query(MaritimeDataCDF).all()
-        record_list = [{
-            "latitude": r.latitude,
-            "longitude": r.longitude,
-            "speed": r.speed,
-            "bearing": r.bearing,
-            "course": r.course,
-            "sys_trk_no": r.sys_trk_no,
-            "raw_data": r.raw_data
-        } for r in all_records]
+        # all_records = db.query(MaritimeDataCDF).all()
+        # record_list = [{
+        #     "latitude": r.latitude,
+        #     "longitude": r.longitude,
+        #     "speed": r.speed,
+        #     "bearing": r.bearing,
+        #     "course": r.course,
+        #     "sys_trk_no": r.sys_trk_no,
+        #     "raw_data": r.raw_data
+        # } for r in all_records]
 
-        run_spark_etl(record_list)
+        # run_spark_etl(record_list)
 
         return {
             "message": f"{inserted} structured records saved and ETL executed successfully",
