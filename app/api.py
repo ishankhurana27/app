@@ -12,6 +12,15 @@ import pandas as pd
 from fastapi.responses import StreamingResponse
 from io import BytesIO
 from pyspark.sql import SparkSession
+from minio import Minio
+from minio.error import S3Error
+from pymongo import MongoClient
+import uuid
+from datetime import datetime, timezone
+import io
+import os                  
+from app.config import MINIO_CLIENT, METADATA_COLLECTION
+
 
 router = APIRouter()
 
@@ -87,29 +96,31 @@ async def upload_file(
         source = db.query(Source).filter(func.lower(Source.name) == upload_source.lower()).first()
         sub_source = db.query(SubSource).first()
 
+        file_uuid = uuid.uuid4()  # File-level UUID
         inserted = 0
         for line in lines:
-            print(f"Processing line: {line}")
             if not line.strip():
                 continue
             try:
-                upload_uuid = str(uuid.uuid4())
+                record_uuid = uuid.uuid4()  # Per-record UUID
                 json_obj = json.loads(line)
-                if upload_source.lower() == "piracy":
-                    cdf_data = convert_to_piracy(json_obj,upload_uuid)
-                elif upload_source.lower() == "ais":
-                    cdf_data = convert_to_ais(json_obj,upload_uuid)
-                elif upload_source.lower() == "dmas":
-                    cdf_data = convert_to_cdf(json_obj,upload_uuid)
-                elif upload_source.lower() == "p8i":
-                    cdf_data=convert_to_cdf_from_csv_row(json_obj,upload_uuid)
-            
 
+                # Choose the correct ETL converter
+                if upload_source.lower() == "piracy":
+                    cdf_data = convert_to_piracy(json_obj, record_uuid)
+                elif upload_source.lower() == "ais":
+                    cdf_data = convert_to_ais(json_obj, record_uuid)
+                elif upload_source.lower() == "dmas":
+                    cdf_data = convert_to_cdf(json_obj, record_uuid,file_uuid)
+                elif upload_source.lower() == "p8i":
+                    cdf_data = convert_to_cdf_from_csv_row(json_obj, record_uuid)
                 else:
-                    print("source not found")
+                    continue
 
                 db_data = MaritimeDataCDF(
                     **cdf_data,
+                    uuid=record_uuid,
+                    file_uuid=file_uuid,
                     source_id=source.id if source else 1,
                     sub_source_id=sub_source.id if sub_source else 1
                 )
@@ -117,34 +128,20 @@ async def upload_file(
                 db.commit()
                 inserted += 1
             except Exception as e:
-                logging.warning(f"Skipping line: {e}")
+                logging.warning(f"Skipping line due to error: {e}")
 
-        # metadata_entry = UploadMetadata(
-        #     file_name=file.filename,
-        #     source_id=source.id if source else 1,
-        #     sub_source_id=sub_source.id if sub_source else 1,
-        #     format="NDJSON",
-        #     record_count=inserted,
-        #     type_of_data=upload_source
-        # )
-        # db.add(metadata_entry)
-        # db.commit()
+        minio_result = await upload_file_to_minio(file)
+        if "error" in minio_result:
+            raise HTTPException(status_code=400, detail=f"MinIO upload failed: {minio_result['error']}")
 
-        # all_records = db.query(MaritimeDataCDF).all()
-        # record_list = [{
-        #     "latitude": r.latitude,
-        #     "longitude": r.longitude,
-        #     "speed": r.speed,
-        #     "bearing": r.bearing,
-        #     "course": r.course,
-        #     "sys_trk_no": r.sys_trk_no,
-        #     "raw_data": r.raw_data
-        # } for r in all_records]
-
-        # run_spark_etl(record_list)
+        mongo_result = store_metadata_in_mongodb(minio_result)
+        if "error" in mongo_result:
+            raise HTTPException(status_code=400, detail=f"MongoDB insert failed: {mongo_result['error']}")
 
         return {
-            "message": f"{inserted} records saved and ETL executed successfully",
+            "message": f"{inserted} records saved",
+            "file_uuid": file_uuid,
+            "minio_metadata": minio_result,
             "type_of_data": upload_source
         }
 
@@ -152,14 +149,20 @@ async def upload_file(
         logging.exception("Failed to process file")
         raise HTTPException(status_code=500, detail="Failed to process file")
 
-
-async def upload_structured(upload_source: str = Query(...), file: UploadFile = File(...), db: Session = Depends(get_db)):
+async def upload_structured(
+    upload_source: str = Query(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
     try:
-        df = parse_structured_file(file)
-        
-        df.columns = df.columns.str.strip().str.replace("\u00a0", " ").str.replace("\t", " ").str.replace(r"\s+", " ", regex=True)
+        file_uuid = str(uuid.uuid4())  # File-level UUID
 
-        print(f"Parsed DataFrame with columns: {upload_source}")
+        # Read content first to reuse it in parse + minio upload
+        file_content = await file.read()
+        file.file.seek(0)  # Reset file pointer for reuse later
+
+        df = parse_structured_file(file_content)
+        df.columns = df.columns.str.strip().str.replace("\u00a0", " ").str.replace("\t", " ").str.replace(r"\s+", " ", regex=True)
 
         source = db.query(Source).filter(func.lower(Source.name) == upload_source.lower()).first()
         sub_source = db.query(SubSource).first()
@@ -168,31 +171,26 @@ async def upload_structured(upload_source: str = Query(...), file: UploadFile = 
         failed_rows = []
 
         for i, row in df.iterrows():
-            upload_uuid = str(uuid.uuid4())
-            print(f"Generated Upload UUID: {upload_uuid}")
+            record_uuid = str(uuid.uuid4())  # Per-record UUID
             try:
                 if upload_source.lower() == "piracy":
-                    cdf_data = convert_to_piracy(row,upload_uuid)
+                    cdf_data = convert_to_piracy(row, record_uuid)
                 elif upload_source.lower() == "ais":
-                    cdf_data = convert_to_ais(row,upload_uuid)
+                    cdf_data = convert_to_ais(row, record_uuid)
                 elif upload_source.lower() == "dmas":
-                    cdf_data = convert_to_cdf(row,upload_uuid)
+                    cdf_data = convert_to_cdf(row, record_uuid)
                 elif upload_source.lower() == "p8i":
-                    cdf_data=convert_to_cdf_from_csv_row(row,upload_uuid)
-            
-
+                    cdf_data = convert_to_cdf_from_csv_row(row, record_uuid)
                 else:
-                    print("source not found")
-    # fallback
-             
+                    failed_rows.append(f"Row {i} skipped: unknown source type")
+                    continue
 
-                 #switch case to handle schema, identify source and call schema accordingly
-               
                 db_data = MaritimeDataCDF(
                     **cdf_data,
+                    uuid=record_uuid,
+                    file_uuid=file_uuid,
                     source_id=source.id if source else 1,
                     sub_source_id=sub_source.id if sub_source else 1
-                    # optionally: add `upload_uuid=upload_uuid` here if MaritimeDataCDF has that field
                 )
                 db.add(db_data)
                 inserted += 1
@@ -200,40 +198,33 @@ async def upload_structured(upload_source: str = Query(...), file: UploadFile = 
                 failed_rows.append(f"Row {i} failed: {e}")
                 logging.warning(f"Row {i} failed: {e}")
 
-        # metadata_entry = UploadMetadata(
-        #     file_name=file.filename,
-        #     source_id=source.id if source else 1,
-        #     sub_source_id=sub_source.id if sub_source else 1,
-        #     format="CSV",
-        #     record_count=inserted,
-        #     type_of_data=upload_source,
-        #     upload_uuid=upload_uuid
-        # )
-        # db.add(metadata_entry)
         db.commit()
 
+        # Upload only after successful parsing
+        file_stream = io.BytesIO(file_content)
+        file_stream.seek(0)
+        file.filename = file.filename  # required by UploadFile wrapper
 
-        # all_records = db.query(MaritimeDataCDF).all()
-        # record_list = [{
-        #     "latitude": r.latitude,
-        #     "longitude": r.longitude,
-        #     "speed": r.speed,
-        #     "bearing": r.bearing,
-        #     "course": r.course,
-        #     "sys_trk_no": r.sys_trk_no,
-        #     "raw_data": r.raw_data
-        # } for r in all_records]
+        minio_result = await upload_file_to_minio(file)
+        if "error" in minio_result:
+            raise HTTPException(status_code=400, detail=f"MinIO upload failed: {minio_result['error']}")
 
-        # run_spark_etl(record_list)
+        mongo_result = store_metadata_in_mongodb(minio_result)
+        if "error" in mongo_result:
+            raise HTTPException(status_code=400, detail=f"MongoDB insert failed: {mongo_result['error']}")
 
         return {
-            "message": f"{inserted} structured records saved and ETL executed successfully",
-            "failures": failed_rows
+            "message": f"{inserted} structured records saved",
+            "file_uuid": file_uuid,
+            "failures": failed_rows,
+            "minio_metadata": minio_result
         }
 
     except Exception as e:
         logging.exception("Structured upload failed")
         raise HTTPException(status_code=500, detail="Structured upload failed")
+
+
 
 # ------------------ EXPORT CDF DATA ------------------
 @router.get("/cdf_data/")
@@ -297,3 +288,90 @@ def list_metadata(db: Session = Depends(get_db)):
         }
         for m in results
     ]
+
+
+# MINIO
+
+FILE_TYPE_BUCKETS = {
+    "image": "images",
+    "pdf": "pdf",
+    "video": "videos",
+    "audio": "audio",
+    "csv": "csv",
+    "json": "json"
+}
+
+def get_file_category(mime_type):
+    if mime_type.startswith("image/"):
+        return "image"
+    elif mime_type == "application/pdf":
+        return "pdf"
+    elif mime_type.startswith("video/"):
+        return "video"
+    elif mime_type.startswith("audio/"):
+        return "audio"
+    elif mime_type == "text/csv" or mime_type == "application/vnd.ms-excel":
+        return "csv"
+    elif mime_type == "application/json":
+        return "json"
+    return None
+
+
+async def upload_file_to_minio(file: UploadFile):
+    try:
+        content_type = file.content_type
+        file_type = get_file_category(content_type)
+
+        # If unknown file type, derive bucket name from file extension
+        if not file_type:
+            ext = os.path.splitext(file.filename)[1].lstrip(".").lower()
+            if ext:
+                bucket_name = f"{ext}-files"
+            else:
+                bucket_name = "misc-files"
+        else:
+            bucket_name = FILE_TYPE_BUCKETS.get(file_type, f"{file_type}-files")
+
+        # Create bucket if it doesn't exist
+        if not MINIO_CLIENT.bucket_exists(bucket_name):
+            MINIO_CLIENT.make_bucket(bucket_name)
+
+        file_uuid = str(uuid.uuid4())
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        content = await file.read()
+
+        file_stream = io.BytesIO(content)
+        MINIO_CLIENT.put_object(
+            bucket_name,
+            file.filename,
+            file_stream,
+            length=len(content),
+            content_type=content_type,
+            metadata={
+                "x-amz-meta-uuid": file_uuid,
+                "x-amz-meta-timestamp": timestamp,
+                "x-amz-meta-type": file_type or ext
+            }
+        )
+
+        return {
+            "filename": file.filename,
+            "uuid": file_uuid,
+            "timestamp": timestamp,
+            "type": file_type or ext,
+            "bucket": bucket_name,
+            "content_type": content_type,
+            "size": len(content)
+        }
+
+    except S3Error as e:
+        return {"error": str(e)}
+
+def store_metadata_in_mongodb(metadata: dict):
+    try:
+        result = METADATA_COLLECTION.insert_one(metadata)
+        metadata.pop("_id", None)
+        return metadata
+    except Exception as e:
+        return {"error": f"MongoDB insert failed: {str(e)}"}
+    

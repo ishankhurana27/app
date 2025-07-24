@@ -12,7 +12,7 @@ import pandas as pd
 
 
 
-def convert_to_cdf(json_data: dict,upload_uuid: str) -> dict:
+def convert_to_cdf(json_data: dict,upload_uuid: str,file_uuid: str) -> dict:
     ts = json_data.get("struct_update_track_timestamp", {})
 
     msg_date = f"{ts.get('date_dd', '00').zfill(2)}-{ts.get('date_mm', '00').zfill(2)}-{ts.get('date_yy', '0000')}"
@@ -35,9 +35,9 @@ def convert_to_cdf(json_data: dict,upload_uuid: str) -> dict:
         "sys_trk_no": int(json_data["sys_trk_no"]),
         "location": f'POINT({json_data["longitude"]} {json_data["latitude"]})',
         "raw_data": json_data,
-        "uuid": upload_uuid
-        
-       
+        "uuid": upload_uuid,
+        "file_uuid": file_uuid,
+
     }
 
 def convert_to_cdf_from_csv_row(row: dict,upload_uuid: str) -> dict:
