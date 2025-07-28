@@ -65,7 +65,7 @@ async def upload_detected_file(
         if content_type in ["application/x-ndjson", "application/json"] or filename.endswith(".ndjson"):
             return await upload_file(upload_source=source, file=file, db=db)
 
-        elif content_type in ["text/csv", "application/vnd.ms-excel"] or filename.endswith(".csv"):
+        elif content_type in ["text/csv", "application/vnd.ms-excel" , "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"] or filename.endswith(".csv"):
             return await upload_structured(upload_source=source, file=file, db=db)
 
         elif content_type.startswith("image/") or filename.endswith((".jpg", ".jpeg", ".png")):
@@ -136,7 +136,16 @@ async def upload_file(
         if "error" in minio_result:
             raise HTTPException(status_code=400, detail=f"MinIO upload failed: {minio_result['error']}")
 
+        if upload_source.isdigit():
+            db = SessionLocal()
+            source_obj = db.query(Source).filter(Source.id == int(upload_source)).first()
+            source_name = source_obj.name if source_obj else "unknown"
+            db.close()
+        else:
+            source_name = upload_source
+        minio_result["source"] = source_name
         mongo_result = store_metadata_in_mongodb(minio_result)
+
         if "error" in mongo_result:
             raise HTTPException(status_code=400, detail=f"MongoDB insert failed: {mongo_result['error']}")
 
@@ -211,7 +220,17 @@ async def upload_structured(
         if "error" in minio_result:
             raise HTTPException(status_code=400, detail=f"MinIO upload failed: {minio_result['error']}")
 
+        if upload_source.isdigit():
+            db = SessionLocal()
+            source_obj = db.query(Source).filter(Source.id == int(upload_source)).first()
+            source_name = source_obj.name if source_obj else "unknown"
+            db.close()
+        else:
+            source_name = upload_source
+
+        minio_result["source"] = source_name
         mongo_result = store_metadata_in_mongodb(minio_result)
+
         if "error" in mongo_result:
             raise HTTPException(status_code=400, detail=f"MongoDB insert failed: {mongo_result['error']}")
 
@@ -415,3 +434,88 @@ def get_sub_sources(source_id: int, db: Session = Depends(get_db)):
     if not sub_sources:
         raise HTTPException(status_code=404, detail="No sub-sources found for this source_id")
     return sub_sources
+
+
+@router.get("/file-history")
+def get_file_history():
+    try:
+        metadata_list = list(METADATA_COLLECTION.find({}, {'_id': 0}))  # Exclude Mongo's _id
+        return JSONResponse(content=metadata_list)
+    except Exception as e:
+        logging.exception("Failed to fetch file history")
+        raise HTTPException(status_code=500, detail="Failed to fetch file history")
+
+
+@router.get("/file/raw-data/{uuid}")
+def fetch_raw_data_by_uuid(uuid: str):
+    try:
+        # Search all buckets for the file with matching uuid
+        for bucket in MINIO_CLIENT.list_buckets():
+            bucket_name = bucket.name
+            objects = MINIO_CLIENT.list_objects(bucket_name, recursive=True)
+
+            for obj in objects:
+                try:
+                    stat = MINIO_CLIENT.stat_object(bucket_name, obj.object_name)
+                    metadata = stat.metadata
+                    if metadata.get("x-amz-meta-uuid") == uuid:
+                        # Match found, fetch file content
+                        response = MINIO_CLIENT.get_object(bucket_name, obj.object_name)
+                        content = response.read()
+                        response.close()
+                        response.release_conn()
+
+                        return StreamingResponse(
+                            BytesIO(content),
+                            media_type=stat.content_type,
+                            headers={"Content-Disposition": f"attachment; filename={obj.object_name}"}
+                        )
+                except S3Error as e:
+                    logging.warning(f"Error checking object {obj.object_name} in bucket {bucket_name}: {e}")
+                    continue
+
+        raise HTTPException(status_code=404, detail=f"No file found with uuid: {uuid}")
+
+    except Exception as e:
+        logging.exception("Failed to fetch raw data from MinIO")
+        raise HTTPException(status_code=500, detail="Failed to fetch raw data from MinIO")
+
+
+
+
+from fastapi.responses import StreamingResponse, JSONResponse
+
+@router.get("/file/metadata/{uuid}")
+def get_file_metadata(uuid: str, download: bool = False):
+    try:
+        # Fetch from MongoDB
+        result = METADATA_COLLECTION.find_one({"uuid": uuid})
+        if not result:
+            raise HTTPException(status_code=404, detail="Metadata not found")
+
+        result["_id"] = str(result["_id"])  # Convert ObjectId to str
+
+        if download:
+            # Extract required info
+            bucket = result["bucket"]
+            filename = result["filename"]
+            content_type = result.get("content_type", "application/octet-stream")
+
+            try:
+                file_data = MINIO_CLIENT.get_object(bucket, filename)
+                return StreamingResponse(
+                    file_data,
+                    media_type=content_type,
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'}
+                )
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to download: {str(e)}")
+
+        # Return just metadata
+        return JSONResponse(content=result)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
