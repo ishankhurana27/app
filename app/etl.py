@@ -210,17 +210,30 @@ def convert_to_postgres_timestamp(msg_date: str, msg_time: str) -> str:
     )
     full_dt = datetime.combine(date_obj, datetime.min.time()) + time_delta
     return full_dt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-def parse_structured_file(file) -> pd.DataFrame:
-    filename = file.filename.lower()
-    file.file.seek(0)
+
+# def parse_structured_file(file) -> pd.DataFrame:
+#     filename = file.filename.lower()
+#     file.file.seek(0)
+#     if filename.endswith(".csv"):
+#         return pd.read_csv(BytesIO(file.file.read()))
+#     elif filename.endswith(".tsv"):
+#         return pd.read_csv(BytesIO(file.file.read()), sep="\t")
+#     elif filename.endswith(".xlsx"):
+#         return pd.read_excel(BytesIO(file.file.read()))
+#     else:
+#         raise ValueError("Unsupported file format")
+
+def parse_structured_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    filename = filename.lower()
     if filename.endswith(".csv"):
-        return pd.read_csv(BytesIO(file.file.read()))
+        return pd.read_csv(BytesIO(file_bytes))
     elif filename.endswith(".tsv"):
-        return pd.read_csv(BytesIO(file.file.read()), sep="\t")
+        return pd.read_csv(BytesIO(file_bytes), sep="\t")
     elif filename.endswith(".xlsx"):
-        return pd.read_excel(BytesIO(file.file.read()))
+        return pd.read_excel(BytesIO(file_bytes))
     else:
         raise ValueError("Unsupported file format")
+
     
 def dms_to_decimal(coord_str: str) -> float:
     try:

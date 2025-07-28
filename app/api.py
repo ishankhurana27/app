@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 import io
 import os                  
 from app.config import MINIO_CLIENT, METADATA_COLLECTION
+from fastapi.responses import JSONResponse
 
 
 router = APIRouter()
@@ -119,8 +120,8 @@ async def upload_file(
 
                 db_data = MaritimeDataCDF(
                     **cdf_data,
-                    uuid=record_uuid,
-                    file_uuid=file_uuid,
+                    # uuid=record_uuid,
+                    # file_uuid=file_uuid,
                     source_id=source.id if source else 1,
                     sub_source_id=sub_source.id if sub_source else 1
                 )
@@ -130,7 +131,7 @@ async def upload_file(
             except Exception as e:
                 logging.warning(f"Skipping line due to error: {e}")
 
-        minio_result = await upload_file_to_minio(file)
+        minio_result = await upload_file_to_minio(file, file_uuid=str(file_uuid))
         if "error" in minio_result:
             raise HTTPException(status_code=400, detail=f"MinIO upload failed: {minio_result['error']}")
 
@@ -161,7 +162,7 @@ async def upload_structured(
         file_content = await file.read()
         file.file.seek(0)  # Reset file pointer for reuse later
 
-        df = parse_structured_file(file_content)
+        df = parse_structured_file(file_content, filename=file.filename)
         df.columns = df.columns.str.strip().str.replace("\u00a0", " ").str.replace("\t", " ").str.replace(r"\s+", " ", regex=True)
 
         source = db.query(Source).filter(func.lower(Source.name) == upload_source.lower()).first()
@@ -187,7 +188,7 @@ async def upload_structured(
 
                 db_data = MaritimeDataCDF(
                     **cdf_data,
-                    uuid=record_uuid,
+                    # uuid=record_uuid,
                     file_uuid=file_uuid,
                     source_id=source.id if source else 1,
                     sub_source_id=sub_source.id if sub_source else 1
@@ -205,7 +206,7 @@ async def upload_structured(
         file_stream.seek(0)
         file.filename = file.filename  # required by UploadFile wrapper
 
-        minio_result = await upload_file_to_minio(file)
+        minio_result = await upload_file_to_minio(file, file_uuid=file_uuid)
         if "error" in minio_result:
             raise HTTPException(status_code=400, detail=f"MinIO upload failed: {minio_result['error']}")
 
@@ -253,20 +254,32 @@ def get_all_cdf_data(db: Session = Depends(get_db)):
                 "source": source_name.name if source_name else None,
                 "sub_source": sub_source_name.name if sub_source_name else None,
                 "location": location_wkt,
-                "raw_data": row.raw_data,
+                "logged_timestamp": row.logged_timestamp.isoformat() if row.logged_timestamp else None,
+                "vessel_name": row.vessel_name,
+                "imo": row.imo,
+                "mmsi": row.mmsi,   
+                "uuid": str(row.uuid),
+                "file_uuid": str(row.file_uuid),
+
+                # "raw_data": row.raw_data,
+
             })
 
         df = pd.DataFrame(response)
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-            df.to_excel(writer, index=False, sheet_name="CDF Data")
-        output.seek(0)
+        json_data = df.to_dict(orient="records")
 
-        return StreamingResponse(
-            output,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            headers={"Content-Disposition": "attachment; filename=cdf_export.xlsx"}
-        )
+# Return as JSON response
+        return JSONResponse(content=json_data)
+        # output = BytesIO()
+        # with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        #     df.to_excel(writer, index=False, sheet_name="CDF Data")
+        # output.seek(0)
+
+        # return StreamingResponse(
+        #     output,
+        #     media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        #     headers={"Content-Disposition": "attachment; filename=cdf_export.xlsx"}
+        # )
 
     except Exception as e:
         logging.exception("Failed to fetch CDF data")
@@ -317,7 +330,7 @@ def get_file_category(mime_type):
     return None
 
 
-async def upload_file_to_minio(file: UploadFile):
+async def upload_file_to_minio(file: UploadFile, file_uuid: str = None):
     try:
         content_type = file.content_type
         file_type = get_file_category(content_type)
@@ -336,7 +349,7 @@ async def upload_file_to_minio(file: UploadFile):
         if not MINIO_CLIENT.bucket_exists(bucket_name):
             MINIO_CLIENT.make_bucket(bucket_name)
 
-        file_uuid = str(uuid.uuid4())
+        file_uuid = file_uuid or str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         content = await file.read()
 

@@ -35,6 +35,7 @@ class MaritimeDataCDF(Base):
     imo = Column(String(50), nullable=True)
     mmsi = Column(String(50), nullable=True)
     file_uuid = Column(UUID(as_uuid=True), unique=True, nullable=False)
+    
 
 
 
