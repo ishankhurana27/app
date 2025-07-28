@@ -21,6 +21,7 @@ import io
 import os                  
 from app.config import MINIO_CLIENT, METADATA_COLLECTION
 from fastapi.responses import JSONResponse
+from app.schemas import SubSourceOut
 
 
 router = APIRouter()
@@ -387,4 +388,30 @@ def store_metadata_in_mongodb(metadata: dict):
         return metadata
     except Exception as e:
         return {"error": f"MongoDB insert failed: {str(e)}"}
-    
+
+
+  #28  
+@router.get("/sources/")
+def get_all_sources(db: Session = Depends(get_db)):
+    try:
+        sources = db.query(Source).all()
+        return [
+            {
+                "id": source.id,
+                "name": source.name
+            }
+            for source in sources
+        ]
+    except Exception as e:
+        logging.exception("Failed to fetch source data")
+        raise HTTPException(status_code=500, detail="Failed to fetch source data")
+
+
+
+
+@router.get("/sub-sources/{source_id}", response_model=list[SubSourceOut])
+def get_sub_sources(source_id: int, db: Session = Depends(get_db)):
+    sub_sources = db.query(SubSource).filter(SubSource.source_id == source_id).all()
+    if not sub_sources:
+        raise HTTPException(status_code=404, detail="No sub-sources found for this source_id")
+    return sub_sources

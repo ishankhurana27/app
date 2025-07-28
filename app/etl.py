@@ -245,3 +245,5 @@ def dms_to_decimal(coord_str: str) -> float:
         return round(decimal, 6)
     except Exception as e:
         raise ValueError(f"Invalid coordinate format: {coord_str}")
+
+
