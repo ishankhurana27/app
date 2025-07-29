@@ -119,10 +119,14 @@ async def upload_file(
                 else:
                     continue
 
+                print(f"Total records attempted: {len(lines)}")
+                print(f"Successfully inserted records: {inserted}")
+
+
                 db_data = MaritimeDataCDF(
                     **cdf_data,
-                    # uuid=record_uuid,
-                    # file_uuid=file_uuid,
+                    #uuid=record_uuid,
+                    file_uuid=file_uuid,
                     source_id=source.id if source else 1,
                     sub_source_id=sub_source.id if sub_source else 1
                 )
