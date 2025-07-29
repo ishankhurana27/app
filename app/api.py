@@ -519,3 +519,80 @@ def get_file_metadata(uuid: str, download: bool = False):
 
 
 
+# @router.get("/structured/cdf/download")
+# def download_cdf_csv(db: Session = Depends(get_db)):
+#     try:
+#         records = db.query(MaritimeDataCDF).all()
+#         data = [r.__dict__ for r in records]
+        
+#         for row in data:
+#             row.pop('_sa_instance_state', None)
+
+#         if not data:
+#             raise HTTPException(status_code=404, detail="No CDF data found")
+
+#         # Convert to CSV
+#         df = pd.DataFrame(data)
+#         output = io.StringIO()
+#         df.to_csv(output, index=False)
+#         output.seek(0)
+
+#         return StreamingResponse(output, media_type='text/csv', headers={
+#             "Content-Disposition": "attachment; filename=cdf_data.csv"
+#         })
+    
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+#     try:
+#         # Query all structured CDF data
+#         records = db.query(MaritimeDataCDF).all()
+
+#         # Convert to DataFrame
+#         data = [r.__dict__ for r in records]
+#         for row in data:
+#             row.pop('_sa_instance_state', None)  # Remove SQLAlchemy internal state
+
+#         df = pd.DataFrame(data)
+
+#         # Convert to Excel in-memory
+#         output = io.BytesIO()
+#         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+#             df.to_excel(writer, index=False, sheet_name='CDF Data')
+#         output.seek(0)
+
+#         return StreamingResponse(output, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+#                                  headers={"Content-Disposition": "attachment; filename=cdf_data.xlsx"})
+
+#     except Exception as e:
+#         return {"error": str(e)}
+    
+
+
+@router.get("/structured/cdf/download/{uuid}")
+def download_cdf_csv(uuid: str, db: Session = Depends(get_db)):
+    try:
+        # Filter CDF records using file_uuid
+        records = db.query(MaritimeDataCDF).filter(MaritimeDataCDF.file_uuid == uuid).all()
+
+        if not records:
+            raise HTTPException(status_code=404, detail="No CDF data found for this UUID")
+
+        # Convert to list of dicts and remove SQLAlchemy state
+        data = [r.__dict__ for r in records]
+        for row in data:
+            row.pop('_sa_instance_state', None)
+
+        # Convert to CSV in memory
+        df = pd.DataFrame(data)
+        output = io.StringIO()
+        df.to_csv(output, index=False)
+        output.seek(0)
+
+        return StreamingResponse(
+            output,
+            media_type='text/csv',
+            headers={"Content-Disposition": f"attachment; filename=cdf_data_{uuid}.csv"}
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
