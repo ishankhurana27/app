@@ -22,6 +22,8 @@ import os
 from app.config import MINIO_CLIENT, METADATA_COLLECTION
 from fastapi.responses import JSONResponse
 from app.schemas import SubSourceOut
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
 
 
 router = APIRouter()
@@ -69,7 +71,37 @@ async def upload_detected_file(
             return await upload_structured(upload_source=source, file=file, db=db)
 
         elif content_type.startswith("image/") or filename.endswith((".jpg", ".jpeg", ".png")):
-            return {"status": "Image file processed", "filename": file.filename}
+         import io
+         from PIL import Image
+     
+         contents = await file.read()
+         image = Image.open(io.BytesIO(contents))
+         metadata = extract_comprehensive_metadata(image, file.filename)
+     
+         file_uuid = str(uuid.uuid4())
+         file.file.seek(0)
+     
+         minio_result = await upload_file_to_minio(file, file_uuid=file_uuid)
+         if "error" in minio_result:
+             raise HTTPException(status_code=400, detail=f"MinIO upload failed: {minio_result['error']}")
+     
+         metadata["file_uuid"] = file_uuid
+         metadata["minio"] = minio_result
+     
+         mongo_result = store_metadata_in_mongodb(metadata)
+         if "error" in mongo_result:
+             raise HTTPException(status_code=400, detail=f"MongoDB insert failed: {mongo_result['error']}")
+     
+         return {
+             "message": "Image metadata extracted and stored",
+             "file_uuid": file_uuid,
+             "minio": minio_result,
+             "summary": metadata.get("summary", {}),
+             "image_info": metadata["image_info"],
+             "camera_info": metadata["camera_info"],
+             "gps_data": metadata["gps_data"]
+         }
+     
 
         elif content_type.startswith("audio/") or filename.endswith((".mp3", ".wav")):
             return {"status": "Audio file processed", "filename": file.filename}
@@ -523,55 +555,6 @@ def get_file_metadata(uuid: str, download: bool = False):
 
 
 
-# @router.get("/structured/cdf/download")
-# def download_cdf_csv(db: Session = Depends(get_db)):
-#     try:
-#         records = db.query(MaritimeDataCDF).all()
-#         data = [r.__dict__ for r in records]
-        
-#         for row in data:
-#             row.pop('_sa_instance_state', None)
-
-#         if not data:
-#             raise HTTPException(status_code=404, detail="No CDF data found")
-
-#         # Convert to CSV
-#         df = pd.DataFrame(data)
-#         output = io.StringIO()
-#         df.to_csv(output, index=False)
-#         output.seek(0)
-
-#         return StreamingResponse(output, media_type='text/csv', headers={
-#             "Content-Disposition": "attachment; filename=cdf_data.csv"
-#         })
-    
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-#     try:
-#         # Query all structured CDF data
-#         records = db.query(MaritimeDataCDF).all()
-
-#         # Convert to DataFrame
-#         data = [r.__dict__ for r in records]
-#         for row in data:
-#             row.pop('_sa_instance_state', None)  # Remove SQLAlchemy internal state
-
-#         df = pd.DataFrame(data)
-
-#         # Convert to Excel in-memory
-#         output = io.BytesIO()
-#         with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-#             df.to_excel(writer, index=False, sheet_name='CDF Data')
-#         output.seek(0)
-
-#         return StreamingResponse(output, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-#                                  headers={"Content-Disposition": "attachment; filename=cdf_data.xlsx"})
-
-#     except Exception as e:
-#         return {"error": str(e)}
-    
-
-
 @router.get("/structured/cdf/download/{uuid}")
 def download_cdf_csv(uuid: str, db: Session = Depends(get_db)):
     try:
@@ -585,7 +568,6 @@ def download_cdf_csv(uuid: str, db: Session = Depends(get_db)):
         data = [r.__dict__ for r in records]
         for row in data:
             row.pop('_sa_instance_state', None)
-
         # Convert to CSV in memory
         df = pd.DataFrame(data)
         output = io.StringIO()
@@ -600,3 +582,142 @@ def download_cdf_csv(uuid: str, db: Session = Depends(get_db)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    
+
+from PIL import Image, ExifTags
+
+def _convert_to_degrees(value, ref):
+    if not value or not ref:
+        return None
+    try:
+        d, m, s = map(float, value)
+        degrees = d + m/60 + s/3600
+        return degrees if ref in ["N", "E"] else -degrees
+    except Exception:
+        return None
+
+def _serialize_exif_value(value):
+    if hasattr(value, 'numerator') and hasattr(value, 'denominator'):
+        return float(value.numerator) / float(value.denominator)
+    elif isinstance(value, (list, tuple)):
+        return [_serialize_exif_value(v) for v in value]
+    elif isinstance(value, dict):
+        return {k: _serialize_exif_value(v) for k, v in value.items()}
+    elif isinstance(value, bytes):
+        decoded = value.decode('utf-8', errors='ignore')
+        return decoded[:200] + "..." if len(decoded) > 200 else decoded
+    return value
+
+def extract_comprehensive_metadata(image: Image.Image, filename: str):
+    from PIL.ExifTags import TAGS, GPSTAGS
+
+    metadata = {
+        "filename": filename,
+        "image_info": {
+            "format": image.format,
+            "mode": image.mode,
+            "size": {
+                "width": image.width,
+                "height": image.height,
+                "resolution": f"{image.width}x{image.height}"
+            }
+        },
+        "exif_data": {},
+        "gps_data": {},
+        "camera_info": {},
+        "timestamp": None
+    }
+
+    try:
+        exif_data = image._getexif()
+        if not exif_data:
+            return metadata
+
+        for tag_id, value in exif_data.items():
+            tag = TAGS.get(tag_id, tag_id)
+
+            if tag in ["DateTimeOriginal", "DateTime"]:
+                try:
+                    dt = datetime.datetime.strptime(value, "%Y:%m:%d %H:%M:%S")
+                    metadata["timestamp"] = dt.isoformat() + "Z"
+                    metadata["date_taken"] = dt.strftime("%Y-%m-%d")
+                    metadata["time_taken"] = dt.strftime("%H:%M:%S")
+                except:
+                    metadata["timestamp"] = value
+
+            elif tag in ["Make", "Model", "Software", "Artist", "Copyright"]:
+                metadata["camera_info"][tag.lower()] = value
+
+            elif tag == "GPSInfo":
+                gps_data = {}
+                for t in value:
+                    sub_tag = GPSTAGS.get(t, t)
+                    gps_data[sub_tag] = _serialize_exif_value(value[t])
+
+                lat = _convert_to_degrees(gps_data.get("GPSLatitude"), gps_data.get("GPSLatitudeRef"))
+                lon = _convert_to_degrees(gps_data.get("GPSLongitude"), gps_data.get("GPSLongitudeRef"))
+
+                metadata["gps_data"] = {
+                    "latitude": lat,
+                    "longitude": lon,
+                    "coordinates": f"{lat:.6f}, {lon:.6f}" if lat and lon else None,
+                    "raw_gps_data": gps_data
+                }
+
+            metadata["exif_data"][tag] = _serialize_exif_value(value)
+    except Exception as e:
+        metadata["error"] = f"Error extracting EXIF data: {str(e)}"
+
+    return metadata
+
+def stringify_keys(obj):
+    """Recursively convert all dictionary keys to strings (MongoDB-safe)."""
+    if isinstance(obj, dict):
+        return {str(k): stringify_keys(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [stringify_keys(i) for i in obj]
+    return obj
+
+
+@router.post("/extract/")
+async def extract_metadata(file: UploadFile = File(...)):
+    try:
+        if not file.content_type or not file.content_type.startswith('image/'):
+            return JSONResponse(status_code=400, content={"error": "File must be an image"})
+
+        contents = await file.read()
+        image = Image.open(io.BytesIO(contents))
+        metadata = extract_comprehensive_metadata(image, file.filename)
+
+        metadata["file_info"] = {
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "file_size_bytes": len(contents),
+            "file_size_mb": round(len(contents) / (1024 * 1024), 2)
+        }
+
+        metadata["summary"] = {
+            "filename": file.filename,
+            "has_gps": bool(metadata.get("gps_data")),
+            "has_camera_info": bool(metadata.get("camera_info")),
+            "has_timestamp": bool(metadata.get("timestamp")),
+            "image_size": metadata["image_info"]["size"],
+            "timestamp": metadata.get("timestamp"),
+            "camera_make": metadata.get("camera_info", {}).get("make"),
+            "camera_model": metadata.get("camera_info", {}).get("model"),
+            "gps_coordinates": metadata.get("gps_data", {}).get("coordinates")
+        }
+
+        # 🔄 Convert all dict keys to string before inserting to MongoDB
+        cleaned_metadata = stringify_keys(metadata)
+
+        inserted = METADATA_COLLECTION.insert_one(cleaned_metadata)
+        cleaned_metadata["_id"] = str(inserted.inserted_id)
+
+        return JSONResponse(content=cleaned_metadata)
+
+    except Exception as e:
+        return JSONResponse(status_code=500, content={"error": f"Error processing image: {str(e)}"})
+    
+
+    
