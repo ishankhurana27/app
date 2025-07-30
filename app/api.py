@@ -24,6 +24,14 @@ from fastapi.responses import JSONResponse
 from app.schemas import SubSourceOut
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
+import os
+import tempfile
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from pypdf import PdfReader
+from docx import Document
+from openpyxl import load_workbook
+from typing import Dict, Any
+import docx2txt
 
 
 router = APIRouter()
@@ -719,5 +727,127 @@ async def extract_metadata(file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Error processing image: {str(e)}"})
     
+
+@router.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    extension = os.path.splitext(file.filename)[1].lower()
+    contents = await file.read()
+    
+    # Create temporary file
+    temp_file = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp_file:
+            temp_file.write(contents)
+            temp_file_path = temp_file.name
+        
+        metadata: Dict[str, Any] = {}
+        
+        if extension == ".pdf":
+            reader = PdfReader(temp_file_path)
+            info = reader.metadata
+            metadata = {key[1:]: value for key, value in info.items() if value}
+            metadata["page_count"] = len(reader.pages)
+            
+        elif extension == ".docx":
+            doc = Document(temp_file_path)
+            metadata["paragraph_count"] = len(doc.paragraphs)
+            metadata["section_count"] = len(doc.sections)
+            metadata["table_count"] = len(doc.tables)
+            
+            # Extract first paragraph text
+            if doc.paragraphs:
+                metadata["first_paragraph"] = doc.paragraphs[0].text[:200] + "..." if len(doc.paragraphs[0].text) > 200 else doc.paragraphs[0].text
+            
+            # Extract document properties safely
+            core_props = doc.core_properties
+            if core_props:
+                # Check if properties exist before accessing them
+                if hasattr(core_props, 'title') and core_props.title:
+                    metadata["title"] = core_props.title
+                if hasattr(core_props, 'author') and core_props.author:
+                    metadata["author"] = core_props.author
+                if hasattr(core_props, 'subject') and core_props.subject:
+                    metadata["subject"] = core_props.subject
+                if hasattr(core_props, 'created') and core_props.created:
+                    metadata["created"] = str(core_props.created)
+                if hasattr(core_props, 'modified') and core_props.modified:
+                    metadata["modified"] = str(core_props.modified)
+                    
+        elif extension == ".doc":
+            # Extract text from .doc file
+            text = docx2txt.process(temp_file_path)
+            metadata["text_length"] = len(text)
+            metadata["word_count"] = len(text.split())
+            
+            # Extract first paragraph (first 200 characters)
+            if text:
+                first_para = text.split('\n')[0] if text.split('\n')[0].strip() else text.split('\n')[1] if len(text.split('\n')) > 1 else ""
+                metadata["first_paragraph"] = first_para[:200] + "..." if len(first_para) > 200 else first_para
+            
+            # Try to get basic file info
+            metadata["file_type"] = "Microsoft Word Document (.doc)"
+            
+        elif extension == ".xlsx":
+            wb = load_workbook(temp_file_path, read_only=True)
+            metadata["sheet_count"] = len(wb.sheetnames)
+            metadata["sheet_names"] = wb.sheetnames
+            
+            # Get info about each sheet
+            sheets_info = []
+            for sheet_name in wb.sheetnames:
+                sheet = wb[sheet_name]
+                sheet_info = {
+                    "name": sheet_name,
+                    "max_row": sheet.max_row,
+                    "max_column": sheet.max_column
+                }
+                sheets_info.append(sheet_info)
+            metadata["sheets_info"] = sheets_info
+            
+            # Extract document properties safely
+            if hasattr(wb, 'properties'):
+                props = wb.properties
+                if hasattr(props, 'title') and props.title:
+                    metadata["title"] = props.title
+                if hasattr(props, 'author') and props.author:
+                    metadata["author"] = props.author
+                if hasattr(props, 'subject') and props.subject:
+                    metadata["subject"] = props.subject
+                if hasattr(props, 'created') and props.created:
+                    metadata["created"] = str(props.created)
+                if hasattr(props, 'modified') and props.modified:
+                    metadata["modified"] = str(props.modified)
+            
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Supported types: .pdf, .doc, .docx, .xlsx")
+        
+
+
+        document = {
+            "uuid": str(uuid.uuid4()),
+            "filename": file.filename,
+            "extension": extension,
+            "upload_time": datetime.utcnow(),
+            "metadata": metadata
+        }
+        result = METADATA_COLLECTION.insert_one(document)
+
+        return {
+            "filename": file.filename,
+            "metadata": metadata,
+            "mongo_id": str(result.inserted_id)
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
+    finally:
+        if temp_file_path and os.path.exists(temp_file_path):
+            try:
+                os.unlink(temp_file_path)
+            except:
+                pass
+        
+        return {"filename": file.filename, "metadata": metadata}
 
     
