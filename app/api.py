@@ -166,7 +166,7 @@ async def upload_file(
                 db_data = MaritimeDataCDF(
                     **cdf_data,
                     #uuid=record_uuid,
-                    file_uuid=file_uuid,
+                    # file_uuid=file_uuid,
                     source_id=source.id if source else 1,
                     sub_source_id=sub_source.id if sub_source else 1
                 )
@@ -243,7 +243,7 @@ async def upload_structured(
                 db_data = MaritimeDataCDF(
                     **cdf_data,
                     # uuid=record_uuid,
-                    file_uuid=file_uuid,
+                    # file_uuid=file_uuid,
                     source_id=source.id if source else 1,
                     sub_source_id=sub_source.id if sub_source else 1
                 )
@@ -599,7 +599,7 @@ def _convert_to_degrees(value, ref):
         return None
     try:
         d, m, s = map(float, value)
-        degrees = d + m/60 + s/3600
+        degrees = d + m / 60 + s / 3600
         return degrees if ref in ["N", "E"] else -degrees
     except Exception:
         return None
@@ -610,15 +610,21 @@ def _serialize_exif_value(value):
     elif isinstance(value, (list, tuple)):
         return [_serialize_exif_value(v) for v in value]
     elif isinstance(value, dict):
-        return {k: _serialize_exif_value(v) for k, v in value.items()}
+        return {str(k): _serialize_exif_value(v) for k, v in value.items()}
     elif isinstance(value, bytes):
         decoded = value.decode('utf-8', errors='ignore')
         return decoded[:200] + "..." if len(decoded) > 200 else decoded
     return value
 
-def extract_comprehensive_metadata(image: Image.Image, filename: str):
-    from PIL.ExifTags import TAGS, GPSTAGS
+def stringify_keys(obj):
+    """Recursively convert all dictionary keys to strings (MongoDB-safe)."""
+    if isinstance(obj, dict):
+        return {str(k): stringify_keys(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [stringify_keys(i) for i in obj]
+    return obj
 
+def extract_comprehensive_metadata(image: Image.Image, filename: str):
     metadata = {
         "filename": filename,
         "image_info": {
@@ -668,24 +674,24 @@ def extract_comprehensive_metadata(image: Image.Image, filename: str):
                 metadata["gps_data"] = {
                     "latitude": lat,
                     "longitude": lon,
-                    "coordinates": f"{lat:.6f}, {lon:.6f}" if lat and lon else None,
+                    "coordinates": f"{lat:.6f}, {lon:.6f}" if lat is not None and lon is not None else None,
                     "raw_gps_data": gps_data
                 }
 
             metadata["exif_data"][tag] = _serialize_exif_value(value)
+
+        # Fallback: if timestamp was not set from DateTimeOriginal
+        if not metadata.get("timestamp") and "DateTime" in metadata["exif_data"]:
+            try:
+                dt = datetime.datetime.strptime(metadata["exif_data"]["DateTime"], "%Y:%m:%d %H:%M:%S")
+                metadata["timestamp"] = dt.isoformat() + "Z"
+            except:
+                pass
+
     except Exception as e:
         metadata["error"] = f"Error extracting EXIF data: {str(e)}"
 
     return metadata
-
-def stringify_keys(obj):
-    """Recursively convert all dictionary keys to strings (MongoDB-safe)."""
-    if isinstance(obj, dict):
-        return {str(k): stringify_keys(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [stringify_keys(i) for i in obj]
-    return obj
-
 
 @router.post("/extract/")
 async def extract_metadata(file: UploadFile = File(...)):
@@ -727,41 +733,158 @@ async def extract_metadata(file: UploadFile = File(...)):
     except Exception as e:
         return JSONResponse(status_code=500, content={"error": f"Error processing image: {str(e)}"})
     
+# @router.post("/upload")
+# async def upload_image(file: UploadFile = File(...)):
+#     extension = os.path.splitext(file.filename)[1].lower()
+#     contents = await file.read()
+    
+#     # Create temporary file
+#     temp_file = None
+#     try:
+#         with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp_file:
+#             temp_file.write(contents)
+#             temp_file_path = temp_file.name
+        
+#         metadata: Dict[str, Any] = {}
+        
+#         if extension == ".pdf":
+#             reader = PdfReader(temp_file_path)
+#             info = reader.metadata
+#             metadata = {key[1:]: value for key, value in info.items() if value}
+#             metadata["page_count"] = len(reader.pages)
+            
+#         elif extension == ".docx":
+#             doc = Document(temp_file_path)
+#             metadata["paragraph_count"] = len(doc.paragraphs)
+#             metadata["section_count"] = len(doc.sections)
+#             metadata["table_count"] = len(doc.tables)
+            
+#             # Extract first paragraph text
+#             if doc.paragraphs:
+#                 metadata["first_paragraph"] = doc.paragraphs[0].text[:200] + "..." if len(doc.paragraphs[0].text) > 200 else doc.paragraphs[0].text
+            
+#             # Extract document properties safely
+#             core_props = doc.core_properties
+#             if core_props:
+#                 # Check if properties exist before accessing them
+#                 if hasattr(core_props, 'title') and core_props.title:
+#                     metadata["title"] = core_props.title
+#                 if hasattr(core_props, 'author') and core_props.author:
+#                     metadata["author"] = core_props.author
+#                 if hasattr(core_props, 'subject') and core_props.subject:
+#                     metadata["subject"] = core_props.subject
+#                 if hasattr(core_props, 'created') and core_props.created:
+#                     metadata["created"] = str(core_props.created)
+#                 if hasattr(core_props, 'modified') and core_props.modified:
+#                     metadata["modified"] = str(core_props.modified)
+                    
+#         elif extension == ".doc":
+#             # Extract text from .doc file
+#             text = docx2txt.process(temp_file_path)
+#             metadata["text_length"] = len(text)
+#             metadata["word_count"] = len(text.split())
+            
+#             # Extract first paragraph (first 200 characters)
+#             if text:
+#                 first_para = text.split('\n')[0] if text.split('\n')[0].strip() else text.split('\n')[1] if len(text.split('\n')) > 1 else ""
+#                 metadata["first_paragraph"] = first_para[:200] + "..." if len(first_para) > 200 else first_para
+            
+#             # Try to get basic file info
+#             metadata["file_type"] = "Microsoft Word Document (.doc)"
+            
+#         elif extension == ".xlsx":
+#             wb = load_workbook(temp_file_path, read_only=True)
+#             metadata["sheet_count"] = len(wb.sheetnames)
+#             metadata["sheet_names"] = wb.sheetnames
+            
+#             # Get info about each sheet
+#             sheets_info = []
+#             for sheet_name in wb.sheetnames:
+#                 sheet = wb[sheet_name]
+#                 sheet_info = {
+#                     "name": sheet_name,
+#                     "max_row": sheet.max_row,
+#                     "max_column": sheet.max_column
+#                 }
+#                 sheets_info.append(sheet_info)
+#             metadata["sheets_info"] = sheets_info
+            
+#             # Extract document properties safely
+#             if hasattr(wb, 'properties'):
+#                 props = wb.properties
+#                 if hasattr(props, 'title') and props.title:
+#                     metadata["title"] = props.title
+#                 if hasattr(props, 'author') and props.author:
+#                     metadata["author"] = props.author
+#                 if hasattr(props, 'subject') and props.subject:
+#                     metadata["subject"] = props.subject
+#                 if hasattr(props, 'created') and props.created:
+#                     metadata["created"] = str(props.created)
+#                 if hasattr(props, 'modified') and props.modified:
+#                     metadata["modified"] = str(props.modified)
+            
+#         else:
+#             raise HTTPException(status_code=400, detail="Unsupported file type. Supported types: .pdf, .doc, .docx, .xlsx")
+        
 
-@router.post("/upload")
-async def upload_file(file: UploadFile = File(...)):
+
+#         document = {
+#             "uuid": str(uuid.uuid4()),
+#             "filename": file.filename,
+#             "extension": extension,
+#             "upload_time": datetime.utcnow(),
+#             "metadata": metadata
+#         }
+#         result = METADATA_COLLECTION.insert_one(document)
+
+#         return {
+#             "filename": file.filename,
+#             "metadata": metadata,
+#             "mongo_id": str(result.inserted_id)
+#         }
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Error processing file: {str(e)}")
+
+#     finally:
+#         if temp_file_path and os.path.exists(temp_file_path):
+#             try:
+#                 os.unlink(temp_file_path)
+#             except:
+#                 pass
+        
+#         return {"filename": file.filename, "metadata": metadata}
+
+
+@router.post("/upload-document")
+async def upload_document(file: UploadFile = File(...)):
     extension = os.path.splitext(file.filename)[1].lower()
     contents = await file.read()
-    
-    # Create temporary file
-    temp_file = None
+    temp_file_path = None
+    metadata: Dict[str, Any] = {}
+
     try:
+        # Save uploaded content to a temporary file
         with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as temp_file:
             temp_file.write(contents)
             temp_file_path = temp_file.name
-        
-        metadata: Dict[str, Any] = {}
-        
+
+        # ---------- Extract metadata ----------
         if extension == ".pdf":
             reader = PdfReader(temp_file_path)
             info = reader.metadata
             metadata = {key[1:]: value for key, value in info.items() if value}
             metadata["page_count"] = len(reader.pages)
-            
+
         elif extension == ".docx":
             doc = Document(temp_file_path)
             metadata["paragraph_count"] = len(doc.paragraphs)
             metadata["section_count"] = len(doc.sections)
             metadata["table_count"] = len(doc.tables)
-            
-            # Extract first paragraph text
             if doc.paragraphs:
                 metadata["first_paragraph"] = doc.paragraphs[0].text[:200] + "..." if len(doc.paragraphs[0].text) > 200 else doc.paragraphs[0].text
-            
-            # Extract document properties safely
             core_props = doc.core_properties
             if core_props:
-                # Check if properties exist before accessing them
                 if hasattr(core_props, 'title') and core_props.title:
                     metadata["title"] = core_props.title
                 if hasattr(core_props, 'author') and core_props.author:
@@ -772,41 +895,30 @@ async def upload_file(file: UploadFile = File(...)):
                     metadata["created"] = str(core_props.created)
                 if hasattr(core_props, 'modified') and core_props.modified:
                     metadata["modified"] = str(core_props.modified)
-                    
+
         elif extension == ".doc":
-            # Extract text from .doc file
             text = docx2txt.process(temp_file_path)
             metadata["text_length"] = len(text)
             metadata["word_count"] = len(text.split())
-            
-            # Extract first paragraph (first 200 characters)
-            if text:
-                first_para = text.split('\n')[0] if text.split('\n')[0].strip() else text.split('\n')[1] if len(text.split('\n')) > 1 else ""
-                metadata["first_paragraph"] = first_para[:200] + "..." if len(first_para) > 200 else first_para
-            
-            # Try to get basic file info
+            first_para = text.split('\n')[0] if text.split('\n')[0].strip() else text.split('\n')[1] if len(text.split('\n')) > 1 else ""
+            metadata["first_paragraph"] = first_para[:200] + "..." if len(first_para) > 200 else first_para
             metadata["file_type"] = "Microsoft Word Document (.doc)"
-            
+
         elif extension == ".xlsx":
             wb = load_workbook(temp_file_path, read_only=True)
             metadata["sheet_count"] = len(wb.sheetnames)
             metadata["sheet_names"] = wb.sheetnames
-            
-            # Get info about each sheet
             sheets_info = []
             for sheet_name in wb.sheetnames:
                 sheet = wb[sheet_name]
-                sheet_info = {
+                sheets_info.append({
                     "name": sheet_name,
                     "max_row": sheet.max_row,
                     "max_column": sheet.max_column
-                }
-                sheets_info.append(sheet_info)
+                })
             metadata["sheets_info"] = sheets_info
-            
-            # Extract document properties safely
-            if hasattr(wb, 'properties'):
-                props = wb.properties
+            props = wb.properties
+            if props:
                 if hasattr(props, 'title') and props.title:
                     metadata["title"] = props.title
                 if hasattr(props, 'author') and props.author:
@@ -817,24 +929,35 @@ async def upload_file(file: UploadFile = File(...)):
                     metadata["created"] = str(props.created)
                 if hasattr(props, 'modified') and props.modified:
                     metadata["modified"] = str(props.modified)
-            
+
         else:
             raise HTTPException(status_code=400, detail="Unsupported file type. Supported types: .pdf, .doc, .docx, .xlsx")
-        
 
+        # ---------- Upload to MinIO ----------
+        file_uuid = str(uuid.uuid4())
+        file.file.seek(0)  # Reset stream
+        minio_result = await upload_file_to_minio(file, file_uuid=file_uuid)
 
+        if "error" in minio_result:
+            raise HTTPException(status_code=400, detail=f"MinIO upload failed: {minio_result['error']}")
+
+        # ---------- Store combined metadata in MongoDB ----------
         document = {
-            "uuid": str(uuid.uuid4()),
+            "uuid": file_uuid,
             "filename": file.filename,
             "extension": extension,
             "upload_time": datetime.utcnow(),
+            "minio": minio_result,
             "metadata": metadata
         }
+
         result = METADATA_COLLECTION.insert_one(document)
 
         return {
             "filename": file.filename,
-            "metadata": metadata,
+            "file_uuid": file_uuid,
+            "minio_metadata": minio_result,
+            "extracted_metadata": metadata,
             "mongo_id": str(result.inserted_id)
         }
 
@@ -845,9 +968,13 @@ async def upload_file(file: UploadFile = File(...)):
         if temp_file_path and os.path.exists(temp_file_path):
             try:
                 os.unlink(temp_file_path)
-            except:
-                pass
-        
-        return {"filename": file.filename, "metadata": metadata}
+            except Exception as cleanup_error:
+                print(f"Error cleaning up temp file: {cleanup_error}")
 
-    
+
+@router.get("/source/name/{source_id}")
+def get_source_name(source_id: int, db: Session = Depends(get_db)):
+    source = db.query(Source).filter(Source.id == source_id).first()
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+    return {"name": source.name}
