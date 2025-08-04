@@ -11,3 +11,4 @@ pypdf
 python-docx
 openpyxl
 python-multipart
+pymongo

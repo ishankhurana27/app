@@ -176,6 +176,8 @@ async def upload_file(
             except Exception as e:
                 logging.warning(f"Skipping line due to error: {e}")
 
+        # Reset file pointer before uploading to MinIO
+        file.file.seek(0)
         minio_result = await upload_file_to_minio(file, file_uuid=str(file_uuid))
         if "error" in minio_result:
             raise HTTPException(status_code=400, detail=f"MinIO upload failed: {minio_result['error']}")
@@ -260,6 +262,8 @@ async def upload_structured(
         file_stream.seek(0)
         file.filename = file.filename  # required by UploadFile wrapper
 
+        # Reset file pointer before uploading to MinIO
+        file.file.seek(0)
         minio_result = await upload_file_to_minio(file, file_uuid=file_uuid)
         if "error" in minio_result:
             raise HTTPException(status_code=400, detail=f"MinIO upload failed: {minio_result['error']}")
@@ -483,7 +487,7 @@ def get_sub_sources(source_id: int, db: Session = Depends(get_db)):
 @router.get("/file-history")
 def get_file_history():
     try:
-        metadata_list = list(METADATA_COLLECTION.find({}, {'_id': 0}))  # Exclude Mongo's _id
+        metadata_list = list(METADATA_COLLECTION.find({}, {'_id': 0}).sort("timestamp", -1))  # Exclude Mongo's _id
         return JSONResponse(content=metadata_list)
     except Exception as e:
         logging.exception("Failed to fetch file history")
