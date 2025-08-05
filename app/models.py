@@ -1,6 +1,7 @@
 from uuid import uuid1
-from sqlalchemy import UUID, Column, DateTime, Integer, String, Float, ForeignKey, func
-from sqlalchemy.dialects.postgresql import JSONB
+#from sqlalchemy import UUID, Column, DateTime, Integer, String, Float, ForeignKey, func
+from sqlalchemy import Column, Integer, String, Float, ForeignKey, DateTime, Date, Time, func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from geoalchemy2 import Geometry
 from app.database import Base
 from sqlalchemy.orm import relationship
@@ -24,18 +25,26 @@ class MaritimeDataCDF(Base):
     speed = Column(Float)
     bearing = Column(Float)
     course = Column(Float)
-    sys_trk_no = Column(Integer,nullable=True)
+    altitude = Column(Float, nullable=True)
+    sys_trk_no = Column(Integer, nullable=True)
     source_id = Column(Integer, ForeignKey("source.id"))
     sub_source_id = Column(Integer, ForeignKey("sub_source.id"))
-    location = Column(Geometry("POINT"),nullable=True)
+    location = Column(Geometry("POINT"), nullable=True)
     raw_data = Column(JSONB)
     uuid = Column(UUID(as_uuid=True), unique=True, nullable=False)
     logged_timestamp = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
-    vessel_name = Column(String, nullable=True)
-    imo = Column(String(50), nullable=True)
-    mmsi = Column(String(50), nullable=True)
     file_uuid = Column(UUID(as_uuid=True), unique=True, nullable=False)
     
+    # Newly added fields
+    msg_date = Column(Date, nullable=True)
+    msg_time = Column(Time, nullable=True)
+    change_type = Column(String, nullable=True)
+    trk_short_name = Column(String, nullable=True)
+    position_valid_date = Column(Date, nullable=True)
+    position_valid_time = Column(Time, nullable=True)
+    trk_display_number = Column(String, nullable=True)
+    sub_source_name = Column(String, nullable=True)
+
 
 
 

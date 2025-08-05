@@ -32,6 +32,10 @@ from docx import Document
 from openpyxl import load_workbook
 from typing import Dict, Any
 import docx2txt
+from app.etl import save_data_to_spark
+from app.etl import convert_to_p8i_tracking
+
+
 
 
 router = APIRouter()
@@ -154,8 +158,14 @@ async def upload_file(
                     cdf_data = convert_to_ais(json_obj, record_uuid)
                 elif upload_source.lower() == "dmas":
                     cdf_data = convert_to_cdf(json_obj, record_uuid,file_uuid)
+
                 elif upload_source.lower() == "p8i":
-                    cdf_data = convert_to_cdf_from_csv_row(json_obj, record_uuid)
+                    sub_source_name = row_or_json_obj.get("sub_source_name", "").lower()
+
+                    if sub_source_name in ["redicent", "garud", "globaleye", "falcon", "netra", "sentinel", "jstars", "phalcon", "heron", "hera"]:
+                         cdf_data = convert_to_p8i_tracking(row_or_json_obj, record_uuid)
+                    else:
+                        cdf_data = convert_to_cdf_from_csv_row(row_or_json_obj, record_uuid)
                 else:
                     continue
 
@@ -219,7 +229,7 @@ async def upload_structured(
         file.file.seek(0)  # Reset file pointer for reuse later
 
         df = parse_structured_file(file_content, filename=file.filename)
-        df.columns = df.columns.str.strip().str.replace("\u00a0", " ").str.replace("\t", " ").str.replace(r"\s+", " ", regex=True)
+        df.columns = df.columns.str.strip().str.replace("\u00a0", " ").str.replace("\t", " ").str.replace(r"\s+", " ", regex=True).str.lower()
 
         source = db.query(Source).filter(func.lower(Source.name) == upload_source.lower()).first()
         sub_source = db.query(SubSource).first()
@@ -237,7 +247,13 @@ async def upload_structured(
                 elif upload_source.lower() == "dmas":
                     cdf_data = convert_to_cdf(row, record_uuid)
                 elif upload_source.lower() == "p8i":
-                    cdf_data = convert_to_cdf_from_csv_row(row, record_uuid)
+                    sub_source_name = row.get("sub_source_name", "").lower()
+
+                    if sub_source_name in ["redicent", "efficnt", "esmcnt", "eoircnt", "ardrcnt", "esm emit beams", "esm emitters"]:
+                        cdf_data = convert_to_p8i_tracking(row, record_uuid)
+                    else:
+                        cdf_data = convert_to_cdf_from_csv_row(row, record_uuid)
+
                 else:
                     failed_rows.append(f"Row {i} skipped: unknown source type")
                     continue
@@ -291,7 +307,8 @@ async def upload_structured(
 
     except Exception as e:
         logging.exception("Structured upload failed")
-        raise HTTPException(status_code=500, detail="Structured upload failed")
+        raise HTTPException(status_code=500, detail=f"Structured upload failed: {e}")
+
 
 
 

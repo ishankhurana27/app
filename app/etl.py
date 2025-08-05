@@ -255,4 +255,152 @@ def dms_to_decimal(coord_str: str) -> float:
     except Exception as e:
         raise ValueError(f"Invalid coordinate format: {coord_str}")
 
+tracking_sources = {"Redicent", "Efficnt", "Esmcnt", "Eoircnt", "Ardrcnt"}
+esm_sources = {"Esm_emit beams", "Esm emitters"}
 
+
+from datetime import datetime
+from typing import Dict, Any
+
+def convert_to_p8i_tracking(row: Dict[str, Any], upload_uuid: str) -> Dict[str, Any]:
+    def safe_parse_date(value: str, fmt: str) -> datetime.date:
+        try:
+            return datetime.strptime(value.strip(), fmt).date() if value else None
+        except Exception:
+            raise ValueError(f"Invalid date format: {value}")
+
+    def safe_parse_time(value: str, fmt: str) -> datetime.time:
+        try:
+            return datetime.strptime(value.strip(), fmt).time() if value else None
+        except Exception:
+            raise ValueError(f"Invalid time format: {value}")
+
+    # Normalize keys to avoid casing or spacing issues
+    row = {k.strip().lower(): v for k, v in row.items()}
+
+    return {
+        "msg_date": safe_parse_date(row.get("msg_date"), "%d-%m-%Y"),
+        "msg_time": safe_parse_time(row.get("msg_time"), "%H:%M:%S"),
+        "change_type": row.get("change_type"),
+        "latitude": float(row.get("latitude", 0)),
+        "longitude": float(row.get("longitude", 0)),
+        "altitude": float(row.get("altitude", 0)),
+        "course": float(row.get("course", 0)),
+        "bearing": float(row.get("bearing", 0)),
+        "speed": float(row.get("speed", 0)),
+        "position_valid_date": safe_parse_date(
+            row.get("position valid date yyyymmdd") or row.get("position_valid_date"),
+            "%Y%m%d" if row.get("position valid date yyyymmdd") else "%d-%m-%Y"
+        ),
+        "position_valid_time": safe_parse_time(row.get("position_valid_time"), "%H:%M:%S"),
+        "trk_short_name": row.get("trk_short_name"),
+        "sub_source_name": row.get("sub_source_name"),
+        "file_uuid": upload_uuid,
+    }
+
+
+import re
+from datetime import datetime
+from typing import Dict, Any
+
+def convert_to_p8i_esm(row: Dict[str, Any], upload_uuid: str) -> Dict[str, Any]:
+    def safe_parse_date(value: str, fmt: str) -> datetime.date:
+        try:
+            return datetime.strptime(value.strip(), fmt).date() if value else None
+        except Exception:
+            raise ValueError(f"Invalid date format: {value}")
+
+    def safe_parse_time(value: str, fmt: str) -> datetime.time:
+        try:
+            return datetime.strptime(value.strip(), fmt).time() if value else None
+        except Exception:
+            raise ValueError(f"Invalid time format: {value}")
+
+    # Normalize + clean headers
+    row = {
+        re.sub(r"\s+", " ", k).strip().lower().replace("\xa0", " "): v
+        for k, v in row.items()
+    }
+
+    pos_date = (
+        row.get("position valid date yyyymmdd")
+        or row.get("position_valid_date")
+        or row.get("date")
+    )
+    pos_time = (
+        row.get("position valid time")
+        or row.get("position_valid_time")
+        or row.get("time")
+    )
+
+    if not pos_date:
+        raise ValueError("Missing required field: Position Valid Date YYYYMMDD")
+
+    return {
+        "msg_date": safe_parse_date(row.get("msg_date"), "%d-%m-%Y"),
+        "msg_time": safe_parse_time(row.get("msg_time"), "%H:%M:%S"),
+        "emitter": row.get("emitter"),
+        "emitter_enumeration": row.get("emitter_enumeration"),
+        "beam_enumeration": row.get("beam_enumeration"),
+        "change_type": row.get("change_type"),
+        "amplitude": float(row.get("amplitude", 0) or 0),
+        "frequency": float(row.get("frequency", 0) or 0),
+
+        # 🔑 Return with the exact expected key
+        "Position Valid Date YYYYMMDD": (
+            safe_parse_date(pos_date, "%Y%m%d")
+            if row.get("position valid date yyyymmdd")
+            else safe_parse_date(pos_date, "%d-%m-%Y")
+        ),
+        "Position Valid Time": safe_parse_time(pos_time, "%H:%M:%S"),
+
+        "last_beam_intercept_date": safe_parse_date(row.get("last_beam_intercept_date"), "%d-%m-%Y"),
+        "last_beam_intercept_time": safe_parse_time(row.get("last_beam_intercept_time"), "%H:%M:%S"),
+
+        "azimuth_degree": float(row.get("azimuth_degree", 0) or 0),
+        "latitude": float(row.get("latitude", 0) or 0),
+        "longitude": float(row.get("longitude", 0) or 0),
+        "azimuth_accuracy_degree": float(row.get("azimuth_accuracy_degree", 0) or 0),
+        "sub_source_name": row.get("sub_source_name"),
+        "file_uuid": upload_uuid,
+    }
+
+
+
+
+
+
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType
+import os
+
+def save_data_to_spark(spark: SparkSession, schema: StructType, rows: list[dict], upload_uuid: str, file_name: str):
+    if not rows:
+        raise ValueError("No data to process.")
+
+    sub_source = rows[0].get("sub_source_name")
+    if not sub_source:
+        raise ValueError("Missing 'sub_source_name' in row.")
+
+    if sub_source in tracking_sources:
+        schema_name = "p8i_tracking"
+        table_name = "tracking_data"
+    elif sub_source in esm_sources:
+        schema_name = "p8i_esm"
+        table_name = "esm_data"
+    else:
+        raise ValueError(f"Unknown sub_source: {sub_source}")
+
+    df = spark.createDataFrame(rows, schema=schema)
+
+    df.write \
+        .format("jdbc") \
+        .option("url", os.getenv("DATABASE_URL")) \
+        .option("dbtable", f"{schema_name}.{table_name}") \
+        .option("user", os.getenv("DATABASE_USER")) \
+        .option("password", os.getenv("DATABASE_PASSWORD")) \
+        .option("driver", "org.postgresql.Driver") \
+        .mode("append") \
+        .save()
+
+    print(f"✅ Data saved to {schema_name}.{table_name}")
